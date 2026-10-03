@@ -136,7 +136,7 @@ export function deleteContainer(id: string) {
   for (const appointment of removedAppointments) appointments.splice(appointments.indexOf(appointment), 1);
   const removedTasks = tasks.filter(task => task.containerId === id);
   for (const task of removedTasks) tasks.splice(tasks.indexOf(task), 1);
-  recordAudit('DELETE', 'container', id, `删除箱务记录，并级联清理 ${removedAppointments.length} 条预约、${removedTasks.length} 条未完成任务`);
+  recordAudit('DELETE', 'container', id, `删除箱务记录，并级联清理 ${removedAppointments.length} 条预约、${removedTasks.length} 条任务`);
   return item;
 }
 
@@ -204,4 +204,80 @@ export function deleteYardTask(id: string) {
   const [item] = tasks.splice(index, 1);
   recordAudit('DELETE', 'yard-task', id, `删除 ${item.containerId} 的场内任务`);
   return item;
+}
+
+export interface DeleteImpactLine { id: string; label: string; status?: string }
+export interface DeleteImpact {
+  entity: 'container' | 'appointment' | 'task';
+  id: string;
+  title: string;
+  caution: boolean;
+  cautionReasons: string[];
+  removed: DeleteImpactLine[];
+  unlinked: DeleteImpactLine[];
+}
+
+const appointmentLabel = (item: GateAppointment) => `${item.type === 'pickup' ? '提箱' : '进场'}预约 · 车辆 ${item.truckNo} · 司机 ${item.driver}`;
+const taskLabel = (item: YardTask) => `${item.kind} 任务 · ${item.from} → ${item.to}`;
+
+export function containerDeleteImpact(id: string): DeleteImpact | undefined {
+  const container = containers.find(item => item.id === id);
+  if (!container) return undefined;
+  const linkedAppointments = appointments.filter(item => item.containerId === id);
+  const linkedTasks = tasks.filter(item => item.containerId === id);
+  const cautionReasons: string[] = [];
+  if (container.status === 'at-gate' || container.status === 'on-quay') cautionReasons.push(`箱当前状态为 ${container.status}，仍在闸口/船边作业链路中`);
+  const committedAppointments = linkedAppointments.filter(item => item.status === 'checked-in' || item.status === 'completed');
+  if (committedAppointments.length) cautionReasons.push(`含 ${committedAppointments.length} 条已签到/已完成预约，删除后闸口作业记录不可追溯`);
+  const committedTasks = linkedTasks.filter(item => item.status === 'executing' || item.status === 'done');
+  if (committedTasks.length) cautionReasons.push(`含 ${committedTasks.length} 条执行中/已完成任务，设备指令与作业历史将一并移除`);
+  const voyage = voyages.find(item => item.id === container.voyageId);
+  return {
+    entity: 'container', id, title: `箱务记录 ${id}`, caution: cautionReasons.length > 0, cautionReasons,
+    removed: [
+      { id, label: `箱务台账记录 · ${container.isoType} · 堆位 ${container.yardSlot}`, status: container.status },
+      ...linkedAppointments.map(item => ({ id: item.id, label: appointmentLabel(item), status: item.status })),
+      ...linkedTasks.map(item => ({ id: item.id, label: taskLabel(item), status: item.status }))
+    ],
+    unlinked: [
+      { id: container.voyageId, label: `航次关联 ${container.voyageId}${voyage ? `（${voyage.vessel}）` : ''} 的箱量挂靠` },
+      { id: container.yardSlot, label: `堆位 ${container.yardSlot} 的占用与自动堆位推荐关联` },
+      ...(container.appointmentId ? [{ id: container.appointmentId, label: `当前预约指针 ${container.appointmentId}` }] : [])
+    ]
+  };
+}
+
+export function appointmentDeleteImpact(id: string): DeleteImpact | undefined {
+  const item = appointments.find(appointment => appointment.id === id);
+  if (!item) return undefined;
+  const container = containers.find(entry => entry.id === item.containerId);
+  const cautionReasons: string[] = [];
+  if (item.status === 'checked-in') cautionReasons.push('车辆已签到进场，删除将中断闸口作业，在场车辆会失去预约依据');
+  if (item.status === 'completed') cautionReasons.push('预约已完成，删除将丢失闸口作业与审计轨迹');
+  const relatedConflicts = gateConflicts().filter(conflict => conflict.appointmentId === id);
+  return {
+    entity: 'appointment', id, title: `闸口预约 ${id}`, caution: cautionReasons.length > 0, cautionReasons,
+    removed: [{ id, label: appointmentLabel(item), status: item.status }],
+    unlinked: [
+      ...(container?.appointmentId === id ? [{ id: container.id, label: `箱 ${container.id} 的当前预约指针（解除后该箱回到无预约状态）` }] : []),
+      ...relatedConflicts.map((conflict, index) => ({ id: `CONFLICT-${index + 1}`, label: `闸口冲突告警将随之清除：${conflict.reason}` }))
+    ]
+  };
+}
+
+export function taskDeleteImpact(id: string): DeleteImpact | undefined {
+  const item = tasks.find(task => task.id === id);
+  if (!item) return undefined;
+  const machine = equipment.find(entry => entry.id === item.equipmentId);
+  const cautionReasons: string[] = [];
+  if (item.status === 'executing') cautionReasons.push('任务正在执行，删除会让设备立即失去作业指令');
+  if (item.status === 'done') cautionReasons.push('任务已完成，删除将丢失作业历史与绩效统计依据');
+  return {
+    entity: 'task', id, title: `作业任务 ${id}`, caution: cautionReasons.length > 0, cautionReasons,
+    removed: [{ id, label: taskLabel(item), status: item.status }],
+    unlinked: [
+      ...(machine ? [{ id: machine.id, label: `设备 ${machine.name} 的指派（释放回设备池）` }] : []),
+      { id: item.containerId, label: `箱 ${item.containerId} 的作业计划关联` }
+    ]
+  };
 }

@@ -22,3 +22,20 @@ test('appointment and task domain operations support create, update and delete',
   assert.equal(updateYardTask(task.id, { to: '北闸口' })?.to, '北闸口');
   assert.equal(deleteYardTask(task.id)?.id, task.id);
 });
+
+test('delete impact summaries expose cascade, unlink and caution signals', async () => {
+  const { containerDeleteImpact, appointmentDeleteImpact, taskDeleteImpact } = await import('./domain.js');
+  const containerImpact = containerDeleteImpact('OOLU-7734201');
+  assert.equal(containerImpact?.caution, true);
+  assert.ok(containerImpact?.removed.some(line => line.id === 'APT-9001'));
+  assert.ok(containerImpact?.unlinked.some(line => line.id === 'VOY-AX7'));
+  const appointmentImpact = appointmentDeleteImpact('APT-9001');
+  assert.equal(appointmentImpact?.caution, true);
+  assert.ok(appointmentImpact?.unlinked.some(line => line.id === 'OOLU-7734201'));
+  const taskImpact = taskDeleteImpact('TASK-101');
+  assert.equal(taskImpact?.caution, false);
+  assert.ok(taskImpact?.unlinked.some(line => line.id === 'YC-12'));
+  assert.equal(containerDeleteImpact('NOPE-0000000'), undefined);
+  assert.equal(appointmentDeleteImpact('APT-0000'), undefined);
+  assert.equal(taskDeleteImpact('TASK-000'), undefined);
+});
