@@ -205,3 +205,66 @@ export function deleteYardTask(id: string) {
   recordAudit('DELETE', 'yard-task', id, `删除 ${item.containerId} 的场内任务`);
   return item;
 }
+
+export interface DeletionEffect { action: 'delete' | 'unlink'; kind: 'container' | 'appointment' | 'yard-task' | 'voyage' | 'yard-plan' | 'equipment'; id: string; label: string; status?: string; }
+export interface DeletionImpact { entity: 'container' | 'appointment' | 'yard-task'; id: string; title: string; effects: DeletionEffect[]; cautions: string[]; }
+
+const appointmentCautions = (appointment: GateAppointment, prefix: string) => {
+  const cautions: string[] = [];
+  if (appointment.status === 'checked-in') cautions.push(`${prefix}已签到，车辆 ${appointment.truckNo} 可能正在闸口或场内作业，删除前请确认车道已释放`);
+  if (appointment.status === 'completed') cautions.push(`${prefix}已完成，删除将移除历史作业记录并影响审计追溯`);
+  return cautions;
+};
+const taskCautions = (task: YardTask, prefix: string) => {
+  const cautions: string[] = [];
+  if (task.status === 'executing') cautions.push(`${prefix}正在执行，删除会中断设备 ${task.equipmentId ?? '（未指派）'} 的当前作业`);
+  if (task.status === 'done') cautions.push(`${prefix}已完成，删除将丢失作业履历`);
+  if (task.status === 'assigned') cautions.push(`${prefix}已指派给设备 ${task.equipmentId}，删除前请确认设备侧已收到取消指令`);
+  return cautions;
+};
+const windowLabel = (appointment: GateAppointment) => `窗口 ${appointment.windowStart.slice(11, 16)}–${appointment.windowEnd.slice(11, 16)}`;
+
+export function containerDeletionImpact(id: string): DeletionImpact | undefined {
+  const container = containers.find(item => item.id === id);
+  if (!container) return undefined;
+  const linkedAppointments = appointments.filter(appointment => appointment.containerId === id);
+  const linkedTasks = tasks.filter(task => task.containerId === id);
+  const plan = containerPlan(id);
+  const effects: DeletionEffect[] = [
+    { action: 'delete', kind: 'container', id, label: `箱务记录 ${id} · ${container.direction} / ${container.status} / 堆位 ${container.yardSlot}`, status: container.status },
+    ...linkedAppointments.map(appointment => ({ action: 'delete' as const, kind: 'appointment' as const, id: appointment.id, label: `闸口预约 ${appointment.id} · ${appointment.type === 'pickup' ? '提箱' : '进场'} · 车辆 ${appointment.truckNo} · ${windowLabel(appointment)}`, status: appointment.status })),
+    ...linkedTasks.map(task => ({ action: 'delete' as const, kind: 'yard-task' as const, id: task.id, label: `场内任务 ${task.id} · ${task.kind} · ${task.from} → ${task.to}`, status: task.status })),
+    { action: 'unlink', kind: 'voyage', id: container.voyageId, label: `解除与航次 ${container.voyageId} 的挂靠关系（航次本身保留）` }
+  ];
+  if (plan?.recommendedBlock) effects.push({ action: 'unlink', kind: 'yard-plan', id: plan.recommendedBlock.id, label: `堆位计划关联失效：推荐区块 ${plan.recommendedBlock.id}（${plan.recommendedBlock.zone}）的自动堆位建议将一并清除` });
+  const cautions = [
+    ...(container.status === 'at-gate' ? [`箱 ${id} 当前正在闸口作业（at-gate），删除会影响在场车辆与车道状态`] : []),
+    ...(container.customs !== 'released' ? [`箱 ${id} 海关状态为 ${container.customs}，删除监管中的箱务记录前请确认已完成报备`] : []),
+    ...linkedAppointments.flatMap(appointment => appointmentCautions(appointment, `关联预约 ${appointment.id} `)),
+    ...linkedTasks.flatMap(task => taskCautions(task, `关联任务 ${task.id} `))
+  ];
+  return { entity: 'container', id, title: `删除箱务 ${id}`, effects, cautions };
+}
+
+export function appointmentDeletionImpact(id: string): DeletionImpact | undefined {
+  const appointment = appointments.find(item => item.id === id);
+  if (!appointment) return undefined;
+  const container = containers.find(item => item.id === appointment.containerId);
+  const effects: DeletionEffect[] = [
+    { action: 'delete', kind: 'appointment', id, label: `闸口预约 ${id} · ${appointment.type === 'pickup' ? '提箱' : '进场'} · 车辆 ${appointment.truckNo} · ${windowLabel(appointment)}`, status: appointment.status }
+  ];
+  if (container) effects.push({ action: 'unlink', kind: 'container', id: container.id, label: container.appointmentId === id ? `解除箱 ${container.id} 的当前预约关联（appointmentId 将清空，箱记录保留）` : `箱 ${container.id} 记录保留，其当前预约指向其他记录，不受影响` });
+  return { entity: 'appointment', id, title: `删除闸口预约 ${id}`, effects, cautions: appointmentCautions(appointment, `预约 ${id} `) };
+}
+
+export function taskDeletionImpact(id: string): DeletionImpact | undefined {
+  const task = tasks.find(item => item.id === id);
+  if (!task) return undefined;
+  const machine = task.equipmentId ? equipment.find(item => item.id === task.equipmentId) : undefined;
+  const effects: DeletionEffect[] = [
+    { action: 'delete', kind: 'yard-task', id, label: `场内任务 ${id} · ${task.kind} · ${task.from} → ${task.to}`, status: task.status }
+  ];
+  if (machine) effects.push({ action: 'unlink', kind: 'equipment', id: machine.id, label: `释放设备 ${machine.name} 的指派占用（设备记录保留）` });
+  effects.push({ action: 'unlink', kind: 'container', id: task.containerId, label: `解除与箱 ${task.containerId} 的作业关联（箱记录保留）` });
+  return { entity: 'yard-task', id, title: `删除场内任务 ${id}`, effects, cautions: taskCautions(task, `任务 ${id} `) };
+}

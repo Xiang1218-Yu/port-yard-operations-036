@@ -22,3 +22,21 @@ test('appointment and task domain operations support create, update and delete',
   assert.equal(updateYardTask(task.id, { to: '北闸口' })?.to, '北闸口');
   assert.equal(deleteYardTask(task.id)?.id, task.id);
 });
+
+test('deletion impact previews cascade effects and cautious warnings', async () => {
+  const { containerDeletionImpact, appointmentDeletionImpact, taskDeletionImpact } = await import('./domain.js');
+  const containerImpact = containerDeletionImpact('OOLU-7734201');
+  assert.ok(containerImpact);
+  assert.ok(containerImpact.effects.some(effect => effect.action === 'delete' && effect.kind === 'appointment' && effect.id === 'APT-9001'));
+  assert.ok(containerImpact.effects.some(effect => effect.action === 'unlink' && effect.kind === 'voyage'));
+  assert.ok(containerImpact.cautions.some(caution => caution.includes('已签到')));
+  const appointmentImpact = appointmentDeletionImpact('APT-9001');
+  assert.ok(appointmentImpact?.effects.some(effect => effect.action === 'unlink' && effect.id === 'OOLU-7734201'));
+  assert.ok(appointmentImpact?.cautions.some(caution => caution.includes('已签到')));
+  const taskImpact = taskDeletionImpact('TASK-101');
+  assert.ok(taskImpact?.effects.some(effect => effect.action === 'unlink' && effect.kind === 'equipment' && effect.id === 'YC-12'));
+  assert.ok(taskImpact?.cautions.some(caution => caution.includes('已指派')));
+  assert.equal(containerDeletionImpact('MISSING-BOX'), undefined);
+  assert.equal(appointmentDeletionImpact('APT-0000'), undefined);
+  assert.equal(taskDeletionImpact('TASK-0000'), undefined);
+});
